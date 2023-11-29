@@ -1,0 +1,275 @@
+package main
+
+import (
+	"database/sql"
+	"github.com/gin-gonic/gin"
+	_ "github.com/go-sql-driver/mysql"
+	"github.com/shirou/gopsutil/v3/cpu"
+	"github.com/shirou/gopsutil/v3/disk"
+	"github.com/shirou/gopsutil/v3/load"
+	"github.com/shirou/gopsutil/v3/mem"
+	"github.com/shirou/gopsutil/v3/net"
+	"log"
+	"sync"
+	"time"
+)
+
+const (
+	dbUser         = "root"
+	dbPassword     = "12345678"
+	dbName         = "monitortest"
+	insertInterval = 1 * time.Second
+)
+
+var db *sql.DB
+var dbMutex = &sync.Mutex{}
+
+type MonitorDataset struct {
+	ID          int       `json:"id"`
+	Timestamp   time.Time `json:"timestamp"`
+	CPUUsage    float64   `json:"cpu_usage"`
+	MemUsage    float64   `json:"mem_usage"`
+	LoadAverage float64   `json:"load_average"`
+	DiskIO      float64   `json:"disk_io"`
+	NetworkIO   float64   `json:"network_io"`
+}
+
+func initDB() {
+	dataSourceName := dbUser + ":" + dbPassword + "@tcp(localhost:3306)/" + dbName + "?parseTime=true&loc=Asia%2FShanghai"
+	var err error
+	db, err = sql.Open("mysql", dataSourceName)
+	if err != nil {
+		log.Fatal("Error opening database:", err)
+	}
+
+	err = db.Ping()
+	if err != nil {
+		log.Fatal("Error pinging database:", err)
+	}
+}
+
+func main() {
+	initDB()
+
+	go func() {
+		ticker := time.NewTicker(insertInterval)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-ticker.C:
+				if err := insertMonitorDataToDB(); err != nil {
+					log.Println("将监控数据插入数据库时发生错误：", err)
+				}
+			}
+		}
+	}()
+
+	r := gin.Default()
+	r.GET("/monitor", LoadMonitor)
+	if err := r.Run(":8080"); err != nil {
+		log.Println("Error starting server:", err)
+	}
+
+	// 关闭数据库连接
+	if err := db.Close(); err != nil {
+		log.Println("Error closing database:", err)
+	}
+}
+
+func insertMonitorDataToDB() error {
+	currentMonitorData, err := getCurrentMonitorData()
+	if err != nil {
+		log.Println("获取当前监控数据时发生错误：", err)
+		return err
+	}
+
+	dbMutex.Lock()
+	defer dbMutex.Unlock()
+
+	if err := insertMonitorData(currentMonitorData); err != nil {
+		log.Println("将监控数据插入数据库时发生错误：", err)
+	}
+	return nil
+}
+
+func insertMonitorData(monitorData MonitorDataset) error {
+	log.Printf("Inserting monitor data: %+v\n", monitorData)
+	_, err := db.Exec(
+		"INSERT INTO monitor_data (timestamp, cpu_usage, mem_usage, load_average, disk_io, network_io) VALUES (?, ?, ?, ?, ?, ?)",
+		//monitorData.Timestamp,
+		monitorData.Timestamp.In(time.FixedZone("CST", 8*60*60)),
+		monitorData.CPUUsage, monitorData.MemUsage, monitorData.LoadAverage, monitorData.DiskIO, monitorData.NetworkIO)
+	if err != nil {
+		log.Println("执行数据库插入查询时出错:", err)
+	}
+	return err
+}
+
+func getCurrentMonitorData() (MonitorDataset, error) {
+	currentTime := time.Now()
+	cpuUsage, err := cpu.Percent(1*time.Second, false)
+	if err != nil {
+		return MonitorDataset{}, err
+	}
+
+	memInfo, err := mem.VirtualMemory()
+	if err != nil {
+		return MonitorDataset{}, err
+	}
+
+	loadAvg, err := load.Avg()
+	if err != nil {
+		return MonitorDataset{}, err
+	}
+
+	diskStat, err := disk.IOCounters()
+	if err != nil {
+		return MonitorDataset{}, err
+	}
+
+	netStat, err := net.IOCounters(true)
+	if err != nil {
+		return MonitorDataset{}, err
+	}
+
+	monitorData := MonitorDataset{
+
+		Timestamp:   currentTime,
+		CPUUsage:    cpuUsage[0],
+		MemUsage:    memInfo.UsedPercent,
+		LoadAverage: loadAvg.Load1,
+		DiskIO:      calculateDiskIO(diskStat),
+		NetworkIO:   calculateNetworkIO(netStat),
+	}
+
+	return monitorData, nil
+}
+
+// 计算磁盘I/O
+func calculateDiskIO(diskStat map[string]disk.IOCountersStat) float64 {
+	totalDiskIO := 0.0
+
+	for _, stat := range diskStat {
+		totalDiskIO += float64(stat.ReadBytes + stat.WriteBytes) //单位转换
+	}
+
+	return totalDiskIO
+}
+
+// 计算网络I/O
+func calculateNetworkIO(netStat []net.IOCountersStat) float64 {
+	var totalNetworkIO float64
+
+	for _, network := range netStat {
+		// 累加每个网络接口的发送和接收总量
+		totalNetworkIO += float64(network.BytesSent + network.BytesRecv)
+	}
+
+	return totalNetworkIO
+}
+
+func LoadMonitor(c *gin.Context) {
+	var params struct {
+		StartTime string `form:"start_time"`
+		EndTime   string `form:"end_time"`
+	}
+
+	if err := c.ShouldBindQuery(&params); err != nil {
+		c.JSON(400, gin.H{"error": "Invalid query parameters"})
+		return
+	}
+
+	var startTime, endTime time.Time
+	var err error
+
+	if params.StartTime == "" && params.EndTime == "" {
+		// 如果未提供开始时间和结束时间，则获取整天的数据
+		startTime = time.Now().Truncate(24 * time.Hour)
+		endTime = startTime.Add(24 * time.Hour).Add(-time.Nanosecond)
+	} else {
+		// 如果提供了开始时间和结束时间，则使用提供的时间范围
+		startTime, err := time.Parse(time.RFC3339, params.StartTime)
+		if err != nil {
+			if e, ok := err.(*time.ParseError); ok {
+				c.JSON(400, gin.H{"error": "Invalid start_time format", "details": e})
+			} else {
+				c.JSON(400, gin.H{"error": "Invalid start_time format"})
+			}
+			return
+		}
+
+		endTime, err := time.Parse(time.RFC3339, params.EndTime)
+		if err != nil {
+			c.JSON(400, gin.H{"error": "Invalid end_time format"})
+			return
+		}
+		startTime = startTime.In(time.FixedZone("CST", 8*60*60))
+		endTime = endTime.In(time.FixedZone("CST", 8*60*60))
+
+		if startTime.After(endTime) {
+			c.JSON(400, gin.H{"error": "start_time must be before end_time"})
+			return
+		}
+	}
+
+	// 根据时间范围从数据库中获取数据
+	monitorData, err := fetchMonitorData(startTime, endTime)
+	if err != nil {
+		log.Println("Error fetching monitor data from the database:", err)
+		c.JSON(500, gin.H{"error": "Error fetching monitor data from the database"})
+		return
+	}
+	// 检查结果集是否为空
+	if len(monitorData) == 0 {
+		c.JSON(200, gin.H{"message": "No monitor data available for the specified time range"})
+		return
+	}
+
+	c.JSON(200, monitorData)
+}
+func fetchMonitorData(startTime, endTime time.Time) ([]MonitorDataset, error) {
+	dbMutex.Lock()
+	defer dbMutex.Unlock()
+
+	var rows *sql.Rows
+	var err error
+
+	// 获取指定时间范围的数据
+	query := "SELECT * FROM monitor_data WHERE 1=1"
+	args := []interface{}{}
+
+	if !startTime.IsZero() {
+		query += " AND timestamp >= ?"
+		args = append(args, startTime)
+	}
+
+	if !endTime.IsZero() {
+		query += " AND timestamp <= ?"
+		args = append(args, endTime)
+	}
+	log.Println("Executing database query:", query)
+	log.Println("Query arguments:", args)
+
+	rows, err = db.Query(query, args...)
+	if err != nil {
+		log.Println("Error executing database query:", err)
+		return nil, err
+	}
+	defer rows.Close()
+
+	var result []MonitorDataset
+
+	// 遍历行并将数据扫描到 MonitorDataset 中
+	for rows.Next() {
+		var data MonitorDataset
+		err := rows.Scan(&data.ID, &data.Timestamp, &data.CPUUsage, &data.MemUsage, &data.LoadAverage, &data.DiskIO, &data.NetworkIO)
+		if err != nil {
+			log.Println("Error scanning row:", err)
+			return nil, err
+		}
+		result = append(result, data)
+	}
+
+	return result, nil
+}
